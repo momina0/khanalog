@@ -67,5 +67,8 @@ On your phone, open the URL in the browser and choose **Add to Home Screen**.
 ## Notes
 
 - Text messages go to `TEXT_MODEL`, photos to `VISION_MODEL`, and `FALLBACK_MODEL` takes over if the
-  primary is rate limited. Defaults are a free model with a near-free paid fallback; all swappable via env.
+  primary is down or returns an empty reply. Defaults are DeepSeek V4.1 Flash with Qwen 3.7 Flash as
+  fallback, about $0.0003 per message; all swappable via env.
+- If the model calls tools but writes no reply, the app asks once more and otherwise composes the
+  reply itself from what the tools did, so you always see what was logged and the running total.
 - The store loads the last 120 days into memory per request; older days stay in Postgres untouched.

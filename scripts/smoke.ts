@@ -52,7 +52,13 @@ async function main() {
     .map((m) => (m.imageUrl ? { ...m, imageUrl: photo } : m))
     .filter((m) => m.text || m.imageUrl);
   // Start clean on a full run; keep the existing log for a photo-only run.
-  if (!PHOTO_ONLY) await fs.rm(path.join(process.cwd(), ".data", `${USER}.json`), { force: true });
+  if (!PHOTO_ONLY) {
+    await fs.rm(path.join(process.cwd(), ".data", `${USER}.json`), { force: true });
+    if (process.env.DATABASE_URL) {
+      const { neon } = await import("@neondatabase/serverless");
+      await neon(process.env.DATABASE_URL).query("DELETE FROM users WHERE id = $1", [USER]);
+    }
+  }
 
   const t0 = Date.now();
   for (const msg of steps) {
@@ -67,7 +73,8 @@ async function main() {
     }
   }
 
-  const saved = JSON.parse(await fs.readFile(path.join(".data", `${USER}.json`), "utf8"));
+  const { getStore } = await import("../lib/store");
+  const saved = await getStore().load(USER);
   console.log("\n--- saved state ---");
   console.log(JSON.stringify({ profile: saved.profile, goal: saved.goal, foods: saved.foods, days: saved.days }, null, 2));
   console.log(`\nTotal: ${((Date.now() - t0) / 1000).toFixed(1)}s`);

@@ -99,6 +99,75 @@ function buildUserContent(msg: IncomingMessage): string | ChatCompletionContentP
   return parts;
 }
 
+interface ToolOutcome {
+  tool: string;
+  args: Record<string, unknown>;
+  result: unknown;
+}
+
+/**
+ * Deterministic reply built from what the tools actually did. Used only when
+ * the model returns nothing, so the user still sees what was logged and the
+ * running total instead of a generic acknowledgement.
+ */
+/** "Today: 480 / 1,334 kcal, 854 left." from the current state. */
+function todayLine(state: UserState): string {
+  const today = summarise(state, dayKey(state.profile.timezone));
+  if (!today.goal) return `Today: ${fmtNum(today.eaten)} kcal.`;
+  const rem = today.remaining ?? 0;
+  return `Today: ${fmtNum(today.eaten)} / ${fmtNum(today.goal)} kcal, ${rem >= 0 ? `${fmtNum(rem)} left` : `${fmtNum(-rem)} over`}.`;
+}
+
+function fallbackReply(state: UserState, outcomes: ToolOutcome[], sideText: string): string {
+  const total = todayLine(state);
+
+  const parts: string[] = [];
+  for (const o of outcomes) {
+    const r = o.result as Record<string, unknown> | null;
+    switch (o.tool) {
+      case "log_food": {
+        const l = r?.logged as { name?: string; calories?: number } | undefined;
+        if (l) parts.push(`Logged ${l.name} (${fmtNum(l.calories ?? 0)} kcal)`);
+        break;
+      }
+      case "log_burned": {
+        const l = r?.logged as { activity?: string; calories?: number } | undefined;
+        if (l) parts.push(`Logged ${l.activity}, ${fmtNum(l.calories ?? 0)} kcal burned`);
+        break;
+      }
+      case "set_steps": {
+        if (r) parts.push(`${fmtNum(Number(r.steps))} steps, about ${fmtNum(Number(r.caloriesFromSteps))} kcal burned`);
+        break;
+      }
+      case "set_profile": {
+        const goal = r?.dailyGoal as number | null | undefined;
+        parts.push(goal ? `Profile saved. Daily target: ${fmtNum(goal)} kcal` : "Profile saved");
+        break;
+      }
+      case "set_goal":
+        parts.push(`Daily target set to ${fmtNum(Number(r?.dailyGoal))} kcal`);
+        break;
+      case "teach_food": {
+        const t = r?.taught as { name?: string; calories?: number } | undefined;
+        if (t) parts.push(`Remembered: ${t.name} = ${fmtNum(t.calories ?? 0)} kcal`);
+        break;
+      }
+      case "delete_last_entry": {
+        const removed = r?.removed as { name?: string; activity?: string } | null | undefined;
+        parts.push(removed ? `Removed ${removed.name ?? removed.activity}` : "Nothing to remove");
+        break;
+      }
+    }
+  }
+
+  if (parts.length === 0) return sideText || `${total}`;
+  return `${parts.join(". ")}. ${total}`;
+}
+
+function fmtNum(n: number): string {
+  return Math.round(n).toLocaleString("en-US");
+}
+
 export class QuotaExceededError extends Error {
   constructor(public limit: number) {
     super(`Daily message limit of ${limit} reached`);
@@ -135,6 +204,12 @@ export async function handleMessage(
   ];
 
   let reply = "";
+  // Text the model sent in the same turn as its tool calls, and what the tools did,
+  // so we can still answer with numbers if the model goes quiet afterwards.
+  let sideText = "";
+  const outcomes: ToolOutcome[] = [];
+  let usedTools = false;
+
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
     const res = await ai.chat.completions.create({
       ...modelRouting(model),
@@ -147,7 +222,20 @@ export async function handleMessage(
       max_tokens: 600,
     });
 
-    const choice = res.choices[0];
+    let choice = res.choices[0];
+    // An empty answer with no tool calls means the model gave up (or burned its
+    // budget on hidden reasoning). Try the fallback model once before moving on.
+    if (!choice?.message?.content?.trim() && !(choice?.message?.tool_calls?.length) && process.env.FALLBACK_MODEL && process.env.FALLBACK_MODEL !== model) {
+      const retry = await ai.chat.completions.create({
+        model: process.env.FALLBACK_MODEL,
+        messages,
+        tools: toolDefinitions,
+        tool_choice: "auto",
+        temperature: 0.3,
+        max_tokens: 600,
+      });
+      choice = retry.choices[0] ?? choice;
+    }
     const assistant = choice.message;
     messages.push(assistant);
 
@@ -156,9 +244,11 @@ export async function handleMessage(
       reply = (assistant.content ?? "").trim();
       break;
     }
+    if (assistant.content?.trim()) sideText = assistant.content.trim();
 
     for (const call of calls) {
       if (call.type !== "function") continue;
+      usedTools = true;
       let args: Record<string, unknown> = {};
       try {
         args = JSON.parse(call.function.arguments || "{}");
@@ -166,11 +256,34 @@ export async function handleMessage(
         args = {};
       }
       const result = runTool(state, call.function.name, args);
+      outcomes.push({ tool: call.function.name, args, result });
       messages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(result) });
     }
   }
 
-  if (!reply) reply = "Done. Anything else?";
+  // The model called tools but never wrote a reply: ask once more, without tools.
+  if (!reply && usedTools) {
+    try {
+      const res = await ai.chat.completions.create({
+        ...modelRouting(model),
+        messages: [...messages, { role: "user", content: "Reply to me now in 1-2 plain sentences using the tool results above. Include today's total." }],
+        temperature: 0.3,
+        max_tokens: 300,
+      });
+      reply = (res.choices[0]?.message.content ?? "").trim();
+    } catch (err) {
+      console.warn("[agent] follow-up reply failed", err);
+    }
+  }
+
+  if (!reply) reply = fallbackReply(state, outcomes, sideText);
+
+  // Whenever the day changed, make sure the running total is in the reply even
+  // if the model forgot it. Users shouldn't have to ask "and how much is that?".
+  const changedDay = outcomes.some((o) => ["log_food", "log_burned", "set_steps", "delete_last_entry"].includes(o.tool));
+  if (changedDay && !/today\s*:/i.test(reply) && !/\d[\d,]*\s*\/\s*\d[\d,]*\s*kcal/i.test(reply)) {
+    reply = `${reply}\n\n${todayLine(state)}`;
+  }
 
   const now = new Date().toISOString();
   state.history.push(
